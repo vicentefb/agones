@@ -38,6 +38,7 @@ import (
 	"github.com/heptiolabs/healthcheck"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.opencensus.io/tag"
 	"gomodules.xyz/jsonpatch/v2"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -103,6 +104,8 @@ type Controller struct {
 	creationWorkerQueue    *workerqueue.WorkerQueue // handles creation only
 	deletionWorkerQueue    *workerqueue.WorkerQueue // handles deletion only
 	recorder               record.EventRecorder
+	generationMap          map[string]int64
+	cMutex                 sync.RWMutex
 }
 
 // NewController returns a new gameserver crd controller
@@ -152,6 +155,8 @@ func NewController(
 		healthController:       NewHealthController(health, kubeClient, agonesClient, kubeInformerFactory, agonesInformerFactory, controllerHooks.WaitOnFreePorts()),
 		migrationController:    NewMigrationController(health, kubeClient, agonesClient, kubeInformerFactory, agonesInformerFactory, controllerHooks.SyncPodPortsToGameServer),
 		missingPodController:   NewMissingPodController(health, kubeClient, agonesClient, kubeInformerFactory, agonesInformerFactory),
+		generationMap:          make(map[string]int64),
+		cMutex:                 sync.RWMutex{},
 	}
 
 	c.baseLogger = runtime.NewLoggerWithType(c)
@@ -448,6 +453,8 @@ func (c *Controller) syncGameServer(ctx context.Context, key string) error {
 	}
 
 	gs, err := c.gameServerLister.GameServers(namespace).Get(name)
+	update := c.newMetrics(ctx)
+
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			loggerForGameServerKey(key, c.baseLogger).Debug("GameServer is no longer available for syncing")
@@ -456,29 +463,65 @@ func (c *Controller) syncGameServer(ctx context.Context, key string) error {
 		return errors.Wrapf(err, "error retrieving GameServer %s from namespace %s", name, namespace)
 	}
 
+	// Before making any Update GameServer request, the controller will compare the generation of the GameServer object
+	// in the Update request with the one in the local cache, and only make the Update request when the generation
+	// in the request is newer.
+
+	c.cMutex.RLock()
+	generationCache, ok := c.generationMap[gs.Name]
+	c.cMutex.RUnlock()
+
+	if ok && (generationCache > gs.ObjectMeta.Generation) {
+		loggerForGameServer(gs, c.baseLogger).WithField("generationInCache", generationCache).WithField("generationInGS", gs.ObjectMeta.Generation).Infof("GameServer is not updated")
+		return workerqueue.NewDebugError(errors.New("GameServer is stale"))
+	}
+
 	if gs, err = c.syncGameServerDeletionTimestamp(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(1), "")
 		return err
 	}
 	if gs, err = c.syncGameServerPortAllocationState(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(2), "")
 		return err
 	}
 	if gs, err = c.syncGameServerCreatingState(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(3), "")
 		return err
 	}
 	if gs, err = c.syncGameServerStartingState(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(4), "")
 		return err
 	}
 	if gs, err = c.syncGameServerRequestReadyState(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(5), "")
 		return err
 	}
 	if gs, err = c.syncDevelopmentGameServer(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(6), "")
 		return err
 	}
 	if err := c.syncGameServerShutdownState(ctx, gs); err != nil {
+		update.recordUpdateError(ctx, int64(7), "")
 		return err
 	}
 
+	update.recordUpdateError(ctx, int64(8), "Success")
+
 	return nil
+}
+
+// newMetrics creates a new gsa latency recorder.
+func (c *Controller) newMetrics(ctx context.Context) *metrics {
+	ctx, err := tag.New(ctx, latencyTags...)
+	if err != nil {
+		c.baseLogger.WithError(err).Warn("failed to tag latency recorder.")
+	}
+	return &metrics{
+		ctx:              ctx,
+		gameServerLister: c.gameServerLister,
+		logger:           c.baseLogger,
+		start:            time.Now(),
+	}
 }
 
 // syncGameServerDeletionTimestamp if the deletion timestamp is non-zero
